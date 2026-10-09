@@ -55,7 +55,11 @@ scratchpad).
    - `python3 $P argument-prep --work $W --name <name>` writes `support_tasks.json`. Each claim
      comes with every other sentence, shuffled, under a random id, with no positions.
    - **Support picks, done blind.** Spawn one subagent and give it *only* the contents of
-     `support_tasks.json`, never the paper. It answers `{"claim<N>": "c<KK>"}` into `picks.json`.
+     `support_tasks.json`, never the paper. It answers
+     `{"claim<N>": {"id": "c<KK>", "quote": "<first ~8 words of that candidate>"}}` into
+     `picks.json`. The quote is required. With 40-odd shuffled ids per claim, judges often name
+     the right sentence and the wrong id, so scoring refuses any pick whose quote isn't in its own
+     candidate. Re-ask the judge for the claims it lists.
      You've read the paper in order, so picking yourself brings back the position bias this step
      exists to remove.
    - `python3 $P argument-score --work $W --name <name>`. Compare the score against

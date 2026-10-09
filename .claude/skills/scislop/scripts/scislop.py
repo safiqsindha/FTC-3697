@@ -67,7 +67,47 @@ def common(roles):
         pat, _, role = spec.rpartition("=")
         extra.append((role, re.compile(pat, re.I)))
     views.ROLE_MAP[:0] = extra
+    patch_views(views)
     return views
+
+
+def fix_section_sign(module):
+    """Every module-level pattern that guards a "§" alternative with \\b gets the letter guard."""
+    for name, val in list(vars(module).items()):
+        if isinstance(val, re.Pattern) and "§" in val.pattern and val.pattern.startswith(r"\b(?:"):
+            setattr(module, name, re.compile(val.pattern.replace(r"\b(?:", r"(?<![A-Za-z])(?:", 1), val.flags))
+
+
+def patch_views(views):
+    """Two corrections to the upstream loader, both of which only ever add what it misses.
+
+    1. TEXT_SECREF_RE opens with \\b before its alternatives, and \\b cannot sit before "§" when a
+       space or "(" precedes it, so "(§4)" was never read as a pointer. The guard becomes "not
+       after a letter", which is what \\b meant for the word alternatives.
+    2. pandoc wraps every heading in \\hypertarget{k}{...} and gives it \\label{k}. Those are
+       generated, not declared by the author, and they enter xsec_ref's denominator as objects no
+       one could be expected to point at; the hypertarget key also leaks into prose. Both are
+       removed for keys that no reference macro uses.
+    """
+    if getattr(views, "_scislop_patched", False):
+        return
+    fix_section_sign(views)
+    orig = views.expand_tex
+
+    def expand_tex(main_path, depth=4):
+        tex, report = orig(main_path, depth)
+        keys = set(re.findall(r"\\hypertarget\{([^{}]+)\}\{", tex))
+        used = {k for m in views.REF_MACRO_RE.finditer(tex) if not views.REF_BLACKLIST.search(m.group(1))
+                for k in re.findall(r"\{([^{}]*)\}", m.group(2))}
+        auto = keys - used
+        if auto:
+            tex = re.sub(r"\\hypertarget\{([^{}]+)\}\{", lambda m: "{" if m.group(1) in auto else m.group(0), tex)
+            tex = re.sub(r"\\label\{([^{}]+)\}", lambda m: "" if m.group(1) in auto else m.group(0), tex)
+            report = dict(report, pandoc_auto_labels_dropped=len(auto))
+        return tex, report
+
+    views.expand_tex = expand_tex
+    views._scislop_patched = True
 
 
 def records(texs):
@@ -133,6 +173,7 @@ def cmd_deterministic(a):
         os.chdir(cdir)
         try:
             import measure
+            fix_section_sign(measure)
             argv = ["measure.py"]
             if "--out" in open("measure.py").read():
                 argv += ["--out", out]
@@ -197,7 +238,8 @@ def cmd_argument_prep(a):
     dump_json(os.path.join(base, "support_tasks.json"),
               {"question": "For each claim, which ONE candidate sentence, if you had read it first, would most "
                            "raise how likely the claim is to be written and believed? Candidates are in random "
-                           "order and carry no positions. Answer {\"claim<N>\": \"c<KK>\"}.",
+                           "order and carry no positions. Answer {\"claim<N>\": {\"id\": \"c<KK>\", \"quote\": "
+                           "\"<the first eight or so words of that candidate, copied exactly>\"}}.",
                "tasks": tasks})
     dump_json(os.path.join(base, "_support_key.json"), key)
     print(f"{len(tasks)} key claims -> {os.path.join(base, 'support_tasks.json')}; answers go in picks.json")
@@ -210,15 +252,28 @@ def cmd_argument_score(a):
     key = load_json(os.path.join(base, "_support_key.json"))
     picks = load_json(os.path.join(base, "picks.json"))
     assert key is not None and picks is not None, "run argument-prep, then write picks.json"
-    n, claims, expected = intro["n"], [], []
+    n, claims, expected, bad = intro["n"], [], [], []
+    norm = lambda s: re.sub(r"\W+", " ", s).strip().lower()
     for c, ids in key.items():
         c = int(c)
-        pick = picks.get(f"claim{c}")
-        assert pick in ids, f"claim{c}: answer {pick!r} is not one of its candidate ids"
-        j = ids[pick]
+        pick = picks.get(f"claim{c}") or {}
+        if isinstance(pick, str):
+            pick = {"id": pick}
+        pid, quote = pick.get("id"), pick.get("quote", "")
+        if pid not in ids:
+            bad.append(f"claim{c}: id {pid!r} is not one of its candidate ids")
+            continue
+        j = ids[pid]
+        # A judge facing forty shuffled ids slips on the id while naming the right sentence; the
+        # quote catches that, and a pick whose quote is not in its own candidate is refused.
+        if not quote or norm(quote) not in norm(intro["sentences"][j - 1]["text"]):
+            bad.append(f"claim{c}: quote {quote!r} is not in candidate {pid}")
+            continue
         claims.append({"i": c, "label": labels[str(c)], "support": j, "argued": j < c,
                        "claim": intro["sentences"][c - 1]["text"]})
         expected.append((c - 1) / (n - 1))
+    if bad:
+        raise SystemExit("picks.json refused; re-ask the judge for these claims:\n  " + "\n  ".join(bad))
     declared = sum(not x["argued"] for x in claims)
     k = len(claims)
     row = {"slop_score": round(declared / k, 4) if k else None, "slop_numerator": declared,
